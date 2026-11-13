@@ -1,0 +1,533 @@
+---
+title: "GP-17 biosolids trial: OSU soil health data, 2024–2026"
+author: "Madelyn Willis"
+date: "2026-11-13"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    embed-resources: true
+    df-print: paged
+execute:
+  warning: false
+  message: false
+---
+
+# 0. Orientation: what this data is
+
+**Site and design.** GP-17 is a long-term biosolids trial set up as a randomized
+complete block design (RCBD): 5 treatments × 3 blocks (reps) = 15 permanent plots.
+Every spring, 8 cores are composited per plot per depth.
+
+**Treatments** (from the 2026 sample list; please confirm the exact definitions with Deirdre):
+
+| Code     | My take on it                                        |
+|----------|------------------------------------------------------|
+| NOFERT   | No fertilizer control                                |
+| AA       | Synthetic N fertilizer (probably anhydrous ammonia)  |
+| 2DTBS    | Biosolids, 2 dry tons/acre                           |
+| 3DTBS    | Biosolids, 3 dry tons/acre                           |
+| 4.5DTBS  | Biosolids, 4.5 dry tons/acre                         |
+
+**Depths.** 0–2" (0–5 cm), 2–6" (5–15 cm), 6–12" (15–30 cm). The 30–60 cm cores go
+for nutrients only and are not sent to OSU.
+
+**OSU Soil Health Lab indicators** (methods match across 2024–2026 per the lab reports):
+
+| Variable        | What it means                                        | Units                      
+|-----------------|------------------------------------------------------|----------------------------|
+| Active C (POXC) | Labile, readily oxidizable C pool                    | mg/kg (ppm)                |
+| CO2 24 h / 96 h | Microbial respiration after rewetting (Solvita-style burst) | µg CO2-C/g soil/day |
+| β-glucosidase   | Enzyme in C cycling (cellulose breakdown)            | nmol/g soil/h              |
+| ACE protein     | Organically bound N available to microbes            | mg protein/g soil          |
+| Total C, N, OM  | **2024 only**                                        | %                          |
+
+**Things to know before comparing years**
+
+* Sampling dates differ: 1 Apr 2024, 10 Apr 2025, **6 May 2026**. Biological indicators
+  (respiration, enzymes) shift through the season, so part of any 2026 difference could
+  be timing.
+* 2026 samples went to the lab in mid-September (2024–2025 went in May). Storage time
+  before analysis was longer.
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(readxl)
+library(here)      # builds paths from the project root (C:/git/biosolids_exploration_2026_2)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(knitr)
+
+theme_set(theme_bw(base_size = 12))
+
+data_dir <- here("data")
+
+trt_levels   <- c("NOFERT", "AA", "2DTBS", "3DTBS", "4.5DTBS")
+depth_levels <- c('0-2"', '2-6"', '6-12"')
+depth_cm     <- c('0-2"' = "0-5 cm", '2-6"' = "5-15 cm", '6-12"' = "15-30 cm")
+
+trt_colors <- c(NOFERT = "#7f7f7f", AA = "#1f77b4",
+                "2DTBS" = "#fdae6b", "3DTBS" = "#e6550d", "4.5DTBS" = "#a63603")
+#relabel for figures:
+trt_labels <- c(NOFERT    = "No fertilizer",
+                AA        = "Synthetic fert",
+                "2DTBS"   = "2 dry ton BS/ac",
+                "3DTBS"   = "3 dry ton BS/ac",
+                "4.5DTBS" = "4.5 dry ton BS/ac")
+relabel_trt <- function(x) trt_labels[x]
+#change year colors to different ones:
+year_colors <- c("2024" = "#980869", "2025" = "#4292c6", "2026" = "#289402")
+
+```
+
+# 1. Load the data
+
+## 1.1 Find the files
+
+The file names in `data/` follow the lab folder convention (`OSU_results_<set>_GP17<yy>`),
+so we match them on the year code.
+
+```{r}
+#| label: find-files
+find_file <- function(pattern) {
+  f <- list.files(data_dir, pattern = pattern, full.names = TRUE)
+  f <- f[!str_detect(basename(f), "^~\\$")]   # skip Excel lock files
+  if (length(f) != 1) stop("Expected 1 file matching '", pattern, "', found ", length(f))
+  f
+}
+
+files <- list(
+  res_2024  = find_file("OSU.results.*GP1724\\.xlsx$"),
+  res_2025  = find_file("OSU.results.*GP1725\\.xlsx$"),
+  res_2026  = find_file("OSU.results.*GP1726\\.xlsx$"),
+  list_2024 = find_file("OSU.sample.list.*GP1724\\.xlsx$"),
+  list_2025 = find_file("OSU.sample.list.*GP1725\\.xlsx$"),
+  list_2026 = find_file("OSU.sample.list.*GP1726\\.xlsx$")
+)
+basename(unlist(files))
+```
+
+## 1.2 Read the lab results
+
+The OSU spreadsheets have a units row above the header, so we skip one line. Column
+names change a little between years (e.g. "Active C" vs "Active Carbon", "Sample ID" vs
+"Customer ID"). The helper below maps them to one set of names.
+
+```{r}
+#| label: read-results
+standardize_cols <- function(df) {
+  nm <- str_squish(tolower(names(df)))
+  new <- case_when(
+    str_detect(nm, "^sample id$|^customer id$") ~ "sample_id",
+    nm == "depth"                               ~ "depth_lab",
+    nm == "project"                             ~ "project",
+    str_detect(nm, "^active c")                 ~ "active_c",
+    str_detect(nm, "respiration 24")            ~ "resp_24h",
+    str_detect(nm, "respiration 96")            ~ "resp_96h",
+    str_detect(nm, "glucosidase")               ~ "bglucosidase",
+    str_detect(nm, "ace protein")               ~ "ace_protein",
+    nm == "c"                                   ~ "total_c",
+    nm == "n"                                   ~ "total_n",
+    nm == "om"                                  ~ "om",
+    .default = NA_character_
+  )
+  df <- df[, !is.na(new)]
+  names(df) <- new[!is.na(new)]
+  df
+}
+
+read_osu <- function(path, sheet, year) {
+  read_excel(path, sheet = sheet, skip = 1) |>
+    standardize_cols() |>
+    filter(!is.na(sample_id)) |>
+    mutate(year = year, .before = 1)
+}
+
+res_raw <- bind_rows(
+  read_osu(files$res_2024, "Spreadsheet Report", 2024),
+  read_osu(files$res_2025, "Spreadsheet Report", 2025),
+  read_osu(files$res_2026, "Report",             2026)
+)
+
+# Keep GP-17 only: sample numbers 7000-7044 each year.
+# (The other IDs are GP-3 or Jirava samples sent in the same set.)
+res <- res_raw |>
+  mutate(id_num = as.integer(str_extract(sample_id, "\\d{4}$"))) |>
+  filter(id_num %in% 7000:7044)
+
+count(res, year)
+```
+
+# 2. Attach plot, block and treatment
+
+## 2.1 The 2026 plot key
+
+Plots are permanent, so the plot → treatment → block assignment from the 2026 sample
+list holds for every year.
+
+```{r}
+#| label: plot-key
+list26 <- read_excel(files$list_2026) |>
+  rename(sample_id = `Sample #`, plot = Plot, block = Rep,
+         treatment = Treat1, depth = Depth, date = Date)
+
+plot_key <- list26 |>
+  distinct(plot, block, treatment) |>
+  arrange(plot)
+
+kable(plot_key, caption = "GP-17 plot layout (from 2026 sample list)")
+stopifnot(nrow(plot_key) == 15)
+```
+
+## 2.2 Sampling dates
+
+```{r}
+#| label: sampling-dates
+read_excel(files$list_2024) |> rename_with(tolower) |>
+  filter(project == "GP-17") |> distinct(date) |> mutate(year = 2024) |>
+  bind_rows(
+    read_excel(files$list_2025) |> filter(project == "GP-17") |>
+      distinct(date) |> mutate(year = 2025),
+    list26 |> distinct(date) |> mutate(year = 2026)
+  ) |>
+  select(year, date) |>
+  kable(caption = "Field sampling date by year")
+```
+
+## 2.3 Rebuild plot numbers for 2024 and 2025
+
+The sample IDs were numbered in two different orders:
+
+* **2025 and 2026:** grouped by depth. 7000–7014 = plots 1–15 at 0–2", 7015–7029 = plots
+  1–15 at 2–6", and so on. The 2026 list confirms this order.
+* **2024:** grouped by plot. 7000/7001/7002 = plot 1 at 0–2", 2–6", 6–12", then
+  7003–7005 = plot 2, and so on.
+
+```{r}
+#| label: assign-plots
+res <- res |>
+  mutate(
+    idx = id_num - 7000,
+    plot_from_id = if_else(year == 2024, idx %/% 3 + 1, idx %% 15 + 1),
+    depth_from_id = if_else(year == 2024,
+                            depth_levels[idx %% 3 + 1],
+                            depth_levels[idx %/% 15 + 1])
+  )
+
+# Check 1: the 2026 rule must reproduce the real 2026 sample list exactly
+check26 <- res |>
+  filter(year == 2026) |>
+  left_join(list26 |> select(sample_id, plot, depth), by = "sample_id")
+stopifnot(all(check26$plot == check26$plot_from_id),
+          all(check26$depth == check26$depth_from_id))
+
+# Check 2: for 2024/2025, the depth implied by the ID rule must match what the lab reported
+check_depth <- res |> filter(year < 2026)
+stopifnot(all(check_depth$depth_lab == check_depth$depth_from_id))
+
+dat <- res |>
+  mutate(plot = plot_from_id, depth = depth_from_id) |>
+  left_join(plot_key, by = "plot") |>
+  mutate(
+    year      = factor(year),
+    treatment = factor(treatment, levels = trt_levels),
+    block     = factor(block),
+    plot      = factor(plot),
+    depth     = factor(depth, levels = depth_levels),
+    depth_lbl = factor(depth_cm[as.character(depth)], levels = depth_cm)
+  ) |>
+  select(year, sample_id, plot, block, treatment, depth, depth_lbl,
+         active_c, resp_24h, resp_96h, bglucosidase, ace_protein,
+         total_c, total_n, om)
+
+# Every year should have 15 plots x 3 depths
+count(dat, year, depth) |> pivot_wider(names_from = depth, values_from = n) |> kable()
+```
+
+**Check 3: does the mapping make sense biologically?** If the plot numbers were wrong,
+plot-level values would not line up from year to year. Surface Active C should correlate
+strongly across years, with biosolids plots high and NOFERT/AA plots low every year.
+
+```{r}
+#| label: mapping-check
+#| fig-height: 4
+surface_wide <- dat |>
+  filter(depth == '0-2"') |>
+  select(year, plot, treatment, active_c) |>
+  pivot_wider(names_from = year, values_from = active_c, names_prefix = "y")
+
+round(cor(surface_wide[, c("y2024", "y2025", "y2026")]), 2) |>
+  kable(caption = "Correlation of plot-level surface Active C between years")
+
+surface_wide |>
+  pivot_longer(starts_with("y"), names_to = "year", values_to = "active_c") |>
+  mutate(year = str_remove(year, "y")) |>
+  ggplot(aes(as.integer(as.character(plot)), active_c, color = treatment)) +
+  geom_point(size = 2.5) +
+  facet_wrap(~year) +
+  scale_color_manual(values = trt_colors, labels = relabel_trt) +
+  scale_x_continuous(breaks = 1:15) +
+  labs(x = "Plot", y = "Active C, 0-5 cm (mg/kg)", color = NULL)
+
+#do same but for 15-30 cm:
+
+```
+
+# 3. Long format and variable labels
+
+Most of the rest of the analysis is easier with one row per sample × variable.
+
+```{r}
+#| label: long-format
+var_labels <- c(
+  active_c     = "Active C (mg/kg)",
+  resp_24h     = "CO2 burst 24 h (µg C/g/d)",
+  resp_96h     = "CO2 96 h (µg C/g/d)",
+  bglucosidase = "β-glucosidase (nmol/g/h)",
+  ace_protein  = "ACE protein (mg/g)"
+)
+core_vars <- names(var_labels)   # measured in all three years
+
+long <- dat |>
+  pivot_longer(all_of(core_vars), names_to = "variable", values_to = "value") |>
+  mutate(var_lbl = factor(var_labels[variable], levels = var_labels))
+
+# Quick scan for missing values or odd numbers
+long |>
+  group_by(variable, year) |>
+  summarise(n = sum(!is.na(value)), min = min(value, na.rm = TRUE),
+            median = median(value, na.rm = TRUE), max = max(value, na.rm = TRUE),
+            .groups = "drop") |>
+  mutate(across(min:max, \(x) signif(x, 3))) |>
+  kable(caption = "Range check by variable and year")
+```
+
+# 4. Summary tables
+
+Mean ± SE across the 3 blocks (n = 3 per cell).
+
+```{r}
+#| label: summary-table
+summ <- long |>
+  group_by(variable, var_lbl, depth_lbl, treatment, year) |>
+  summarise(mean = mean(value), se = sd(value) / sqrt(n()), n = n(), .groups = "drop")
+
+summ |>
+  filter(depth_lbl == "0-5 cm") |>
+  mutate(cell = sprintf("%.1f ± %.1f", mean, se)) |>
+  select(var_lbl, treatment, year, cell) |>
+  pivot_wider(names_from = year, values_from = cell) |>
+  kable(caption = "0-5 cm: treatment means ± SE by year")
+```
+
+Swap `"0-5 cm"` for `"5-15 cm"` or `"15-30 cm"` to see the deeper layers.
+
+# 5. Figures
+
+## 5.1 Treatment × year at each depth
+
+```{r}
+#| label: fig-trt-year
+#| fig-height: 11
+#| fig-width: 10
+ggplot(long, aes(treatment, value, fill = year)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6,
+               position = position_dodge(width = 0.8)) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.8),
+             size = 1.2, alpha = 0.8) +
+  facet_grid(var_lbl ~ depth_lbl, scales = "free_y", switch = "y") +
+  scale_fill_manual(values = year_colors) +
+  labs(x = NULL, y = NULL, fill = "Year") +
+  theme(strip.placement = "outside",
+        axis.text.x = element_text(angle = 35, hjust = 1),
+        legend.position = "top")
+#Save as 10x11 in for a full-page figure:
+#save plot: 
+ggsave("../outputs/fig_trt_year.png", width = 10, height = 11, units = "in", dpi = 300)
+```
+
+## 5.2 Year-to-year trajectories (surface soil)
+
+Lines follow each treatment mean across years. Parallel lines mean the year effect is the
+same for every treatment. Lines that cross or diverge point to a treatment × year
+interaction.
+
+```{r}
+#| label: fig-trajectory
+#| fig-height: 6
+#| fig-width: 10
+summ |>
+  filter(depth_lbl == "0-5 cm") |>
+  ggplot(aes(year, mean, color = treatment, group = treatment)) +
+  geom_line(linewidth = 0.8, position = position_dodge(0.15)) +
+  geom_pointrange(aes(ymin = mean - se, ymax = mean + se),
+                  position = position_dodge(0.15)) +
+  facet_wrap(~var_lbl, scales = "free_y") +
+  scale_color_manual(values = trt_colors, labels = relabel_trt) +
+  labs(x = NULL, y = "Mean ± SE (0-5 cm)", color = NULL)
+```
+
+## 5.3 Depth profiles
+
+```{r}
+#| label: fig-depth
+#| fig-height: 8
+#| fig-width: 11
+summ |>
+  ggplot(aes(mean, fct_rev(depth_lbl), color = treatment, group = treatment)) +
+  geom_path() +
+  geom_point(size = 2) +
+  facet_grid(year ~ var_lbl, scales = "free_x") +
+  scale_color_manual(values = trt_colors, labels = relabel_trt) +
+  labs(x = "Mean", y = NULL, color = NULL) +
+  theme(legend.position = "top")
+
+ggsave("../outputs/fig_depth_profiles.png", width = 11, height = 8, units = "in", dpi = 300)
+```
+
+# 6. Change in 2026 vs 2025 and 2024
+
+Each plot is sampled every year, so we can work out plot-level change and remove the
+plot-to-plot noise. Percent change = (2026 − earlier year) / earlier year × 100.
+
+```{r}
+#| label: change
+change <- long |>
+  select(plot, block, treatment, depth_lbl, variable, var_lbl, year, value) |>
+  pivot_wider(names_from = year, values_from = value, names_prefix = "y") |>
+  mutate(pct_vs_2025 = (y2026 - y2025) / y2025 * 100,
+         pct_vs_2024 = (y2026 - y2024) / y2024 * 100)
+
+change |>
+  group_by(var_lbl, depth_lbl, treatment) |>
+  summarise(across(c(pct_vs_2025, pct_vs_2024), \(x) round(mean(x), 1)),
+            .groups = "drop") |>
+  filter(depth_lbl == "0-5 cm") |>
+  kable(caption = "0-5 cm: mean % change in 2026 relative to 2025 and 2024")
+```
+
+```{r}
+#| label: fig-change
+#| fig-height: 12
+#| fig-width: 10
+change |>
+  pivot_longer(c(pct_vs_2025, pct_vs_2024), names_to = "comparison", values_to = "pct") |>
+  mutate(comparison = recode(comparison, pct_vs_2025 = "2026 vs 2025",
+                             pct_vs_2024 = "2026 vs 2024")) |>
+  ggplot(aes(treatment, pct, color = comparison)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  stat_summary(fun.data = mean_se, position = position_dodge(0.5)) +
+  facet_grid(var_lbl ~ depth_lbl, scales = "free_y") +
+  scale_color_manual(values = c("2026 vs 2025" = "#08306b", "2026 vs 2024" = "#9ecae1"), labels = c("2026 vs 2025" = "2026 vs 2025", "2026 vs 2024" = "2026 vs 2024")) +
+  labs(x = NULL, y = "% change (mean ± SE across blocks)", color = NULL) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1), legend.position = "top")
+```
+
+# 7. Exploratory mixed models
+
+A repeated-measures model per variable and depth:
+
+`value ~ treatment * year + (1 | block) + (1 | plot)`
+
+* `(1 | block)`: RCBD blocking.
+* `(1 | plot)`: the same plots are measured every year (repeated measures).
+* Values are log-transformed because these indicators are right-skewed and the effects
+  tend to be multiplicative.
+
+With 3 blocks the power is limited. Treat this as exploration rather than a final
+analysis.
+
+```{r}
+#| label: models
+fit_one <- function(d) {
+  lmer(log(value) ~ treatment * year + (1 | block) + (1 | plot), data = d)
+}
+
+models <- long |>
+  filter(value > 0) |>
+  group_by(variable, var_lbl, depth_lbl) |>
+  nest() |>
+  mutate(model = map(data, fit_one),
+         anova = map(model, \(m) as_tibble(anova(m), rownames = "term"))) |>
+  ungroup()
+
+models |>
+  select(var_lbl, depth_lbl, anova) |>
+  unnest(anova) |>
+  transmute(var_lbl, depth_lbl, term,
+            F = round(`F value`, 2),
+            p = format.pval(`Pr(>F)`, digits = 2, eps = 0.001)) |>
+  pivot_wider(names_from = term, values_from = c(F, p)) |>
+  arrange(depth_lbl, var_lbl) |>
+  kable(caption = "Type III ANOVA (Satterthwaite df) on log scale")
+```
+
+**Year contrasts within each treatment** (back-transformed, so the ratio is 2026 / earlier
+year). For example, a ratio of 0.80 means 20% lower in 2026.
+
+```{r}
+#| label: emmeans-year
+year_contrasts <- models |>
+  filter(depth_lbl == "0-5 cm") |>
+  mutate(ct = map(model, \(m) {
+    emmeans(m, ~ year | treatment, type = "response") |>
+      contrast(method = list("2026 / 2025" = c(0, -1, 1),
+                             "2026 / 2024" = c(-1, 0, 1))) |>
+      summary(infer = TRUE) |>
+      as_tibble()
+  }))
+
+year_contrasts |>
+  select(var_lbl, ct) |>
+  unnest(ct) |>
+  transmute(var_lbl, treatment, contrast,
+            ratio = round(ratio, 2),
+            CI = sprintf("%.2f–%.2f", lower.CL, upper.CL),
+            p = format.pval(p.value, digits = 2, eps = 0.001)) |>
+  kable(caption = "0-5 cm: year ratios within treatment (unadjusted p)")
+```
+
+**Treatment contrasts within each year** (vs NOFERT):
+
+```{r}
+#| label: emmeans-trt
+models |>
+  filter(depth_lbl == "0-5 cm") |>
+  mutate(ct = map(model, \(m) {
+    emmeans(m, ~ treatment | year, type = "response") |>
+      contrast(method = "trt.vs.ctrl", ref = "NOFERT") |>
+      as_tibble()
+  })) |>
+  select(var_lbl, ct) |>
+  unnest(ct) |>
+  transmute(var_lbl, year, contrast, ratio = round(ratio, 2),
+            p = format.pval(p.value, digits = 2, eps = 0.001)) |>
+  pivot_wider(names_from = year, values_from = c(ratio, p)) |>
+  kable(caption = "0-5 cm: treatment / NOFERT ratio by year (Dunnett-adjusted p)")
+```
+
+# 8. Save the tidy dataset
+
+```{r}
+#| label: save
+write_csv(dat, file.path("../outputs/GP17_OSU_2024-2026_tidy.csv"))
+```
+
+# 9. Notes and next steps
+
+* **Still open:** which synthetic fertilizer AA is.
+* **Interpreting 2026:** sampling was about 4 weeks later than in 2024 and 2025, and lab
+  submission was about 4 months later. Keep both in mind before attributing year
+  differences to treatment history or weather.
+* **Weather:** pull spring precipitation and temperature for each year. Antecedent soil
+  moisture strongly affects respiration and enzyme activity.
+* **More years:** `OSU_results_22-23D_GP1722.xlsx` (2022) has a different layout and adds
+  pH, EC, total C/N, OM and PO4-P. The 2023 results file is not in `data/` yet. Both can be
+  added with the same `read_osu()` approach once the ID-to-plot order for those years is
+  confirmed.
+```
+
+
