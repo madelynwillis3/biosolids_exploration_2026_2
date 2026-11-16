@@ -835,7 +835,7 @@ ggplot(pca_by_depth, aes(PC1, PC2, color = Amendment)) +
 - Soil measurement data results: Within each depth, plots with more C, N and β-glucosidase activity have more microbes (ρ up to 0.85; 48 of 165 correlations significant). Composition of microbes are not greatly impacted by C, N, and b glu. 
 - Biosolids have 35% more total C (0-4") but is only a shallow depth result
 
--Biosolids reduced AMF biomass by ~10% (p = 0.014) but only in the system without cover crop and grazing. This is possibly due to the high P content of biosolids? which reduces AMF colonization. A living cover crop seems to buffer this effect, likely by providing AMF host roots to colonize.
+-Biosolids reduced AMF biomass by ~10% (p = 0.014) but only in the system without cover crop and grazing. This is possibly due to the high P content of biosolids? which reduces AMF colonization? A living cover crop seems to buffer this effect, likely by providing AMF host roots to colonize.
 -Both amendments show:
   slightly more biomass (+8%)
   more Gram-positives (+10–12%)
