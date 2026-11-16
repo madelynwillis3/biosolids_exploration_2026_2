@@ -1,0 +1,845 @@
+---
+title: "11_16_26_biosolids_JS_14_PLFA_exploration"
+format: html
+---
+
+
+# PLFA Exploration
+## Introduction into PLFA:
+**General PLFA Nomenclature**
+
+**Phospholipid fatty acids (PLFA) are an essential structural component of all microbial cellular membranes. The PLFA nomenclature generally follows the pattern of A:BωC. The “A” position identifies the total number of carbon atoms in the fatty acid. Position ‘‘B’’ is the number of double bonds. “C” designates the carbon atom from the aliphatic end before the double bond. This is followed by a “c” for cis or a “t” for trans configuration of monoenoics (i.e., have only one double bond). The abbreviation “br” is used to designate branching. The prefixes “i” and “a” stand for iso and anteiso, respectively. Midchain branching is noted by “me,” and cyclopropyl fatty acids are designated as “cy” or “cyclo.” The position of hydroxy groups are noted. Saturated fatty acids can be straight or branched chains and have no double bonds, meaning that the chain of carbon atoms is fully "saturated" with hydrogen atoms. Saturated straight chains are designated as 12:0, 13:0, 18:0, etc., and are ubiquitous. Monounsaturated fatty acids (MUFA) have only one double bond (e.g., 16:1ω7c), whereas polyunsaturated fatty acids (PUFA) have more than one double bond (e.g., 18:2ω6,9c or 18: 3ω3,6,9c).Neutral lipid fatty acids (NLFA) are used as a lipid energy storage by eukaryotes and fungi. NLFA analysis can be used to check the general health and nutrient status of fungi by looking at the amounts in relating fungi biomarkers compared to the amount of PLFAs found in sample. NLFA amounts have a positive relationship with organic carbon content. Organic carbon acts as a food source, so in general, more carbon allows for a larger and more well fed microbial community. This will lead to a higher NLFA/PLFA ratio, where the fungi have an excess of energy to store as NLFAs instead of strictly trying to survive, which can be interpreted as less stress for the fungi. Conversely, when under stress, fungi can focus more on energy storage rather than growth for survival during periods of dormancy, so NLFA ratios should be interpreted with care. Bacteria store energy differently, so NLFA should not be used when only bacterial nutrient/stress status is sought. One common lipid that NLFA is used to check for is 16:1 w5c. This is typically used as an arbuscular mycorrhizal fungi (AMF) biomarker, but in methane rich environments such as wetlands or even high manure fields, this can also be a biomarker for methanotrophs. Since bacteria do not have NLFA stores, NLFA can confirm the presence of AMF. It is important to note that some bacteria can produce NLFAs under certain circumstances. These bacteria are actinobacteria and a few species of gram negative bacteria that appear in PLFA biomarker 18:1 w7c.**
+## 1. Packages and file paths
+```{r Packages, message=FALSE}
+#Packages:
+library(readxl)
+library(lmerTest)      # also loads lme4
+library(emmeans)
+library(multcomp)
+library(multcompView)
+library(vegan)
+library(tidyverse)     # load last so dplyr::select isn't masked by MASS::select
+```
+
+```{r data}
+
+options(contrasts = c("contr.sum", "contr.poly"))
+
+plfa_file <- "../data/ElAnMy_2600043_PLFA.xlsx" 
+key_file  <- "../data/26-07D.xlsx"
+```
+
+## 2. Sample key (what each sample is)
+
+**What:** Read the "Treatments from log" sheet. Make clean factors for
+amendment, management system, depth, rep (block), and plot.
+
+**Why:** `Treat2` (cover crop) and `Treat3` (grazing) always occur together:
+every CvrCrop plot is grazed and every NoCCrop plot is not. **We cannot**
+separate the cover-crop effect from the grazing effect, so I combine them into
+one factor, `System` (CC + Graze vs. No CC / No Graze). The design is then a 3
+(amendment) × 2 (system) factorial, 3 reps, and 3 depths sampled in each plot.
+NoFert is listed first so it serves as the control.
+
+
+```{r trts and key}
+#| label: sample-key
+key <- read_excel(key_file, sheet = "Treatments from log", skip = 1,
+                  .name_repair = "unique_quiet") |>
+  dplyr::select(Sample = `Sample #`, Plot, Rep, Treat1, Treat2, Treat3, Depth) |>
+  filter(!is.na(Sample)) |>
+  mutate(
+    Amendment = factor(Treat1, levels = c("NoFert", "Fertilizer", "Biosolids")),
+    System    = factor(if_else(Treat2 == "CvrCrop", "CC + Graze", "No CC / No Graze"),
+                       levels = c("No CC / No Graze", "CC + Graze")),
+    Depth     = factor(Depth, levels = c('0-4"', '4-8"', '8-12"')),
+    Rep       = factor(Rep),
+    Plot      = factor(Plot)
+  )
+
+# Confirm the confounding of Treat2 and Treat3, and check the design is balanced
+count(key, Treat2, Treat3)
+count(key, Amendment, System, Depth)
+```
+
+## 3. Read the PLFA sheets and join them to the key
+
+**What:** Write a small function that reads any sheet from the lab file and
+pulls the short sample number (e.g., `D26-7060`) out of the long lab ID
+(`USA-WA-017-ELANMY-D26-7060`). Then build one tidy table with the main
+response variables.
+
+**Why these variables** (from the SHAC primer):
+
+- **Total PLFA (nmol/g):** a proxy for total living microbial biomass.
+- **Microbial groups (nmol/g):** AMF, Gram−, Gram+, Actinobacteria, Fungi
+  (MIDI uses 18:2ω6c only), and Eukaryotes. Methanotrophs are 0 in every sample,
+  so I dropped them.
+- **Microbial groups (mol %):** community *composition*. A treatment can change
+  the relative makeup of the community without changing total biomass.
+- **Ratios:** Fungi:Bacteria, Gram+:Gram−, Sat:Unsat, Mono:Poly, Predator:Prey,
+  and Gram− stress. SHAC's stress ratio is (16:1ω7c + 18:1ω7c) /
+  (cy17:0 + cy19:0), so **lower = more stress**.
+- **NLFA/PLFA:** fungal energy storage relative to living biomass.
+
+The doc suggests converting pmol/g to nmol/g (÷ 1000) to keep the numbers
+readable.
+```{r}
+#| label: read-plfa
+read_shac <- function(sheet) {
+  read_excel(plfa_file, sheet = sheet) |>
+    mutate(Sample = str_extract(`Sample ID`, "D\\d{2}-\\d{4}")) |>
+    dplyr::select(-`Sample ID`, -`SHAC ID`, -`Project ID`, -`Weight(g)`, -Date)
+}
+
+total   <- read_shac("Amnt-P") |>
+  dplyr::select(Sample, total_PLFA = `Total PLFA (pmols/g)`, n_peaks = `Total PLFA#`)
+
+microbe <- read_shac("Microbe-P") |>
+  dplyr::select(-Methanotroph) |>
+  dplyr::rename_with(~ paste0(make.names(.x), "_nmol"), -Sample)
+
+microbe_pct <- read_shac("Microbe%-P") |>
+  dplyr::select(-Methanotroph) |>
+  dplyr::rename_with(~ paste0(make.names(.x), "_pct"), -Sample)
+
+ratios  <- read_shac("Ratio-P") |>
+  rename(F_B = `Fungi/Bacteria`, Pred_Prey = `Predator/Prey`,
+         Gpos_Gneg = `Gram+/Gram-`, Sat_Unsat = `Sat/Unsat`,
+         Mono_Poly = `Mono/Poly`, Gneg_stress = `Gram- Stress`)
+
+nlfa    <- read_shac("Amnt-N") |>
+  dplyr::select(Sample, NLFA_PLFA = `NLFA/PLFA`)
+
+plfa <- key |>
+  left_join(total,       by = "Sample") |>
+  left_join(microbe,     by = "Sample") |>
+  left_join(microbe_pct, by = "Sample") |>
+  left_join(ratios,      by = "Sample") |>
+  left_join(nlfa,        by = "Sample") |>
+  mutate(total_PLFA = total_PLFA / 1000,
+         across(ends_with("_nmol"), ~ .x / 1000))
+
+# Check: should be 54 rows and no missing values (every sample matched)
+nrow(plfa)
+sum(is.na(plfa$total_PLFA))
+```
+
+
+## 4. Summary table (mean ± SE)
+
+**What:** Mean and standard error for each Amendment × System × Depth cell
+(n = 3 reps each).
+
+**Why:** Look at the raw numbers before running any stats. This is the
+"global read" the doc recommends, and it's the table to report.
+
+```{r}
+#| label: summary-table
+responses <- c("total_PLFA", "AM.Fungi_nmol", "Gram.Negative_nmol",
+               "Gram.Positive_nmol", "Actinomycetes_nmol", "Fungi_nmol",
+               "Eukaryote_nmol", "F_B", "Gpos_Gneg", "Sat_Unsat",
+               "Mono_Poly", "Gneg_stress", "Pred_Prey", "NLFA_PLFA")
+
+summary_tbl <- plfa |>
+  pivot_longer(all_of(responses), names_to = "variable") |>
+  group_by(variable, Depth, System, Amendment) |>
+  summarise(mean = mean(value), se = sd(value) / sqrt(n()), .groups = "drop") |>
+  mutate(mean_se = sprintf("%.2f ± %.2f", mean, se))
+
+summary_tbl |>
+  filter(variable == "total_PLFA") |>
+  dplyr::select(Depth, System, Amendment, mean_se)
+```
+
+## 5. Plot the data
+
+**What:** Show each response by amendment, with depth as columns and system as
+color. Each point is one plot.
+
+**Why:** With only 3 reps, it's better to show the individual points than just
+bars. You can see the spread, any outliers, and whether depth dominates.
+
+```{r}
+#| label: plot-function
+plot_resp <- function(var, ylab) {
+  ggplot(plfa, aes(Amendment, .data[[var]], color = System)) +
+    stat_summary(fun = mean, geom = "crossbar", width = 0.5,
+                 position = position_dodge(0.6)) +
+    geom_point(position = position_dodge(0.6), size = 2, alpha = 0.7) +
+    facet_wrap(~ Depth) +
+    labs(x = NULL, y = ylab, color = NULL) +
+    theme_bw() +
+    theme(legend.position = "bottom")
+}
+
+plot_resp("total_PLFA", "Total PLFA (nmol/g soil)")
+plot_resp("F_B", "Fungi : Bacteria")
+plot_resp("Gneg_stress", "Gram− stress ratio (lower = more stress)")
+```
+**What:** A stacked bar of community composition (mol %).
+
+**Why:** It shows how the *relative* makeup of the community shifts across
+treatments and depths.
+
+```{r}
+#| label: composition-plot
+plfa |>
+  pivot_longer(ends_with("_pct"), names_to = "Group", values_to = "pct") |>
+  mutate(Group = str_remove(Group, "_pct") |> str_replace_all("\\.", " ")) |>
+  group_by(Depth, System, Amendment, Group) |>
+  summarise(pct = mean(pct), .groups = "drop") |>
+  ggplot(aes(Amendment, pct, fill = Group)) +
+  geom_col() +
+  facet_grid(System ~ Depth) +
+  labs(x = NULL, y = "mol % of assigned PLFA", fill = NULL) +
+  theme_bw()
+```
+
+## 6. Mixed-model ANOVA for each response
+
+**What:** For each variable, fit
+
+`y ~ Amendment * System * Depth + (1 | Rep) + (1 | Plot)`
+
+**Why this model:**
+
+- **Fixed effects:** Amendment, System, Depth, and all their interactions. These
+  are the treatment comparisons you were asked for.
+- **`(1 | Rep)`:** reps are blocks (plots 11–16 are rep 1, 21–26 are rep 2, and so on).
+- **`(1 | Plot)`:** the three depths come from the *same* plot, so they are not
+  independent. Without this term the model would act as if there were 54
+  independent samples, and the p-values would be too small.
+
+The amendment and system effects are tested against plot-to-plot variation
+(about 3 reps' worth). Depth and its interactions are tested within plots.
+`lmerTest` gives Satterthwaite F-tests.
+
+A "boundary (singular) fit" message usually means the Rep variance estimated as
+~0. With only 3 blocks that's common and not a problem for the fixed-effect
+tests.
+
+```{r}
+#| label: anova-loop
+# Biomass variables (nmol/g) with no zeros are log-transformed;
+# Eukaryotes, Pred_Prey (contain zeros) and the ratios stay on the raw scale
+log_vars <- c("total_PLFA", "AM.Fungi_nmol", "Gram.Negative_nmol",
+              "Gram.Positive_nmol", "Actinomycetes_nmol", "Fungi_nmol")
+
+fit_one <- function(var) {
+  y <- if (var %in% log_vars) paste0("log(", var, ")") else var
+  f <- as.formula(paste(y, "~ Amendment * System * Depth + (1 | Rep) + (1 | Plot)"))
+  lmer(f, data = plfa)
+}
+
+models <- set_names(responses) |> map(fit_one)
+
+anova_tbl <- imap_dfr(models, function(m, v) {
+  a <- anova(m, type = 3)
+  tibble(variable = v,
+         scale = if_else(v %in% log_vars, "log", "raw"),
+         term = rownames(a),
+         F = round(a$`F value`, 2),
+         p = signif(a$`Pr(>F)`, 3))
+})
+
+anova_tbl |>
+  dplyr::select(variable, scale, term, p) |>
+  pivot_wider(names_from = term, values_from = p)
+```
+
+**Check the model assumptions.** Look at residuals for total PLFA (do the same
+for any variable you report). If the residuals fan out, try `log(y)` in the
+formula.
+
+```{r}
+#| label: diagnostics
+m <- models$total_PLFA
+par(mfrow = c(1, 2))
+plot(fitted(m), resid(m), xlab = "Fitted", ylab = "Residual"); abline(h = 0, lty = 2)
+qqnorm(resid(m)); qqline(resid(m))
+par(mfrow = c(1, 1))
+```
+
+## 7. Pairwise comparisons (which treatments differ?)
+
+**What:** Use `emmeans` to compare amendments *within each depth and system*,
+with Tukey adjustment. Compact letters: groups that share a letter are not
+significantly different.
+
+**Why:** The ANOVA only says *whether* there's an effect. This step says *which*
+amendments differ, and at which depth. If the ANOVA shows no Amendment × System
+interaction, you can average over System
+(`emmeans(m, ~ Amendment | Depth)`) for a simpler story.
+
+```{r}
+#| label: posthoc
+
+posthoc <- function(var, specs = ~ Amendment | Depth * System) {
+  em <- if (var %in% log_vars) {
+    emmeans(models[[var]], specs, tran = "log")
+  } else {
+    emmeans(models[[var]], specs)
+  }
+  cld(em, Letters = letters, type = "response") |>
+    as_tibble() |>
+    mutate(.group = str_trim(.group))
+}
+
+posthoc("total_PLFA")
+posthoc("total_PLFA", ~ Amendment | Depth)   # averaged over System
+posthoc("F_B",        ~ Amendment | Depth)
+```
+
+## 8. Whole-community composition (PERMANOVA + NMDS)
+
+**What:** Use the mol % of every individual PLFA peak (the `Amnt%-P` sheet) as
+a "fingerprint" of each sample. Then:
+
+1. Make a Bray–Curtis dissimilarity between samples.
+2. Run **PERMANOVA** (`adonis2`) to test whether amendment or system shifts the
+   overall community profile.
+3. Draw an **NMDS** plot to see it.
+
+**Why:** The univariate tests above look at one group at a time. PERMANOVA
+asks whether the *whole* profile differs. I run it **separately for each
+depth**, because depths within a plot are not independent and depth will
+dominate everything. `strata = Rep` keeps the permutations within blocks.
+
+Peaks found in fewer than 10% of samples are dropped (rare or noise peaks).
+
+```{r}
+#| label: community
+set.seed(12038)   # reproducible NMDS
+peaks <- read_shac("Amnt%-P")
+peak_cols <- setdiff(names(peaks), "Sample")
+keep <- peak_cols[colMeans(peaks[peak_cols] > 0) >= 0.10]
+
+comm <- key |> left_join(peaks |> dplyr::select(Sample, all_of(keep)), by = "Sample")
+
+permanova_by_depth <- map_dfr(levels(comm$Depth), function(d) {
+  sub <- filter(comm, Depth == d)
+  res <- adonis2(sub[keep] ~ Amendment * System, data = sub,
+                 method = "bray", permutations = 999,
+                 strata = sub$Rep, by = "terms")
+  tibble(Depth = d, term = rownames(res), R2 = round(res$R2, 3),
+         F = round(res$F, 2), p = res$`Pr(>F)`)
+})
+permanova_by_depth |> filter(!term %in% c("Residual", "Total"))
+
+# Check dispersion: PERMANOVA can be fooled by unequal spread between groups
+map(levels(comm$Depth), function(d) {
+  sub <- filter(comm, Depth == d)
+  anova(betadisper(vegdist(sub[keep], "bray"), sub$Amendment))
+}) |> set_names(levels(comm$Depth))
+```
+
+```{r}
+#| label: nmds
+set.seed(14)
+nmds <- metaMDS(comm[keep], distance = "bray", k = 2, trymax = 100, trace = FALSE)
+nmds$stress   # < 0.2 is usually considered acceptable
+
+as_tibble(scores(nmds, display = "sites")) |>
+  bind_cols(dplyr::select(comm, Amendment, System, Depth)) |>
+  ggplot(aes(NMDS1, NMDS2, color = Amendment)) +
+  geom_point(aes(shape = System), size = 3, alpha = 0.8) +
+  stat_ellipse(aes(group = Amendment), linetype = 2, show.legend = FALSE) +
+  facet_wrap(~ Depth) +
+  theme_bw() +
+  labs(caption = paste("Stress =", round(nmds$stress, 3)))
+```
+#9. Additional stuff
+
+### Summary
+**Only effect is depth. No detectable differences between fertilizers or cover cropping/ grazing in any variable.**
+
+
+```{r anova and other vars}
+#| label: anova-loop
+log_vars <- c("total_PLFA", "AM.Fungi_nmol", "Gram.Negative_nmol",
+              "Gram.Positive_nmol", "Actinomycetes_nmol", "Fungi_nmol")
+
+fit_one <- function(var) {
+  y <- if (var %in% log_vars) paste0("log(", var, ")") else var
+  f <- as.formula(paste(y, "~ Amendment * System * Depth +",
+                        "(1 | Rep) + (1 | Rep:System) + (1 | Plot)"))
+  lmer(f, data = plfa)
+}
+
+models <- set_names(responses) |> map(fit_one)
+
+anova_tbl <- imap_dfr(models, function(m, v) {
+  a <- anova(m, type = 3)
+  tibble(variable = v,
+         scale    = if_else(v %in% log_vars, "log", "raw"),
+         term     = rownames(a),
+         F        = round(a$`F value`, 2),
+         df_num   = a$NumDF,
+         df_den   = round(a$DenDF, 1),
+         p        = signif(a$`Pr(>F)`, 3),
+         eta2_p   = round((a$`F value` * a$NumDF) /
+                          (a$`F value` * a$NumDF + a$DenDF), 2))
+})
+
+# p-values
+anova_tbl |>
+  dplyr::select(variable, term, p) |>
+  pivot_wider(names_from = term, values_from = p)
+
+# effect sizes (partial eta-squared)
+anova_tbl |>
+  dplyr::select(variable, term, eta2_p) |>
+  pivot_wider(names_from = term, values_from = eta2_p)
+```
+```{r posthoc for above}
+#| label: posthoc
+get_emm <- function(var, specs, mods = models) {
+  if (var %in% log_vars) emmeans(mods[[var]], specs, tran = "log")
+  else emmeans(mods[[var]], specs)
+}
+
+posthoc <- function(var, specs = ~ Amendment | Depth * System) {
+  cld(get_emm(var, specs), Letters = letters, type = "response") |>
+    as_tibble() |>
+    mutate(.group = str_trim(.group))
+}
+
+posthoc("total_PLFA")
+posthoc("total_PLFA", ~ Amendment | Depth)
+posthoc("F_B",        ~ Amendment | Depth)
+```
+```{r effect sizes}
+#| label: effect-sizes
+mean_col <- function(d) rename_with(d, ~ "mean", any_of(c("response", "emmean")))
+
+effect_vs_control <- function(var) {
+  em   <- get_emm(var, ~ Amendment | Depth)
+  ctrl <- summary(em, type = "response") |> as_tibble() |> mean_col() |>
+    filter(Amendment == "NoFert") |>
+    dplyr::select(Depth, ctrl_mean = mean)
+  con  <- contrast(em, "trt.vs.ctrl", ref = "NoFert", adjust = "none")
+  out  <- summary(con, infer = TRUE, type = "response") |> as_tibble() |>
+    left_join(ctrl, by = "Depth")
+  if (var %in% log_vars) {
+    out |> transmute(variable = var, Depth, contrast,
+                     diff       = round(ctrl_mean * (ratio - 1), 3),
+                     pct_change = round(100 * (ratio - 1), 1),
+                     pct_lower  = round(100 * (lower.CL - 1), 1),
+                     pct_upper  = round(100 * (upper.CL - 1), 1),
+                     p          = round(p.value, 3))
+  } else {
+    out |> transmute(variable = var, Depth, contrast,
+                     diff       = round(estimate, 3),
+                     pct_change = round(100 * estimate / ctrl_mean, 1),
+                     pct_lower  = round(100 * lower.CL / ctrl_mean, 1),
+                     pct_upper  = round(100 * upper.CL / ctrl_mean, 1),
+                     p          = round(p.value, 3))
+  }
+}
+
+effects_tbl <- map_dfr(responses, effect_vs_control)
+effects_tbl
+effects_tbl |> filter(variable == "total_PLFA")
+```
+```{r power and mdd}
+#| label: power-mdd
+mdd_one <- function(var, power = 0.80, alpha = 0.05) {
+  em  <- get_emm(var, ~ Amendment | Depth)
+  avg <- summary(em, type = "response") |> as_tibble() |> mean_col() |>
+    group_by(Depth) |> summarise(mean = mean(mean))
+  summary(pairs(em, adjust = "none")) |> as_tibble() |>
+    group_by(Depth) |> summarise(SE = mean(SE), df = mean(df)) |>
+    left_join(avg, by = "Depth") |>
+    mutate(mdd     = (qt(1 - alpha / 2, df) + qt(power, df)) * SE,
+           mdd_pct = if (var %in% log_vars) 100 * (exp(mdd) - 1)
+                     else 100 * mdd / mean,
+           reps_for_20pct = ceiling(3 * (mdd_pct / 20)^2)) |>
+    transmute(variable = var, Depth,
+              mdd_pct = round(mdd_pct, 1), reps_for_20pct)
+}
+
+mdd_tbl <- map_dfr(responses, mdd_one)
+mdd_tbl |>
+  pivot_wider(names_from = Depth, values_from = c(mdd_pct, reps_for_20pct))
+```
+```{r planned contrasts}
+#| label: planned-contrasts
+planned <- list("Amended vs NoFert"       = c(-1, 0.5, 0.5),
+                "Biosolids vs Fertilizer" = c( 0, -1,  1))
+# order of levels: NoFert, Fertilizer, Biosolids
+
+planned_one <- function(var, specs = ~ Amendment | Depth, mods = models) {
+  con <- contrast(get_emm(var, specs, mods), planned, adjust = "none")
+  s   <- summary(con, infer = TRUE, type = "response") |> as_tibble()
+  is_log <- "ratio" %in% names(s)
+  s |>
+    mutate(variable = var,
+           effect   = if (is_log) "% change" else "difference",
+           estimate = if (is_log) round(100 * (ratio - 1), 1) else signif(estimate, 3),
+           lower    = if (is_log) round(100 * (lower.CL - 1), 1) else signif(lower.CL, 3),
+           upper    = if (is_log) round(100 * (upper.CL - 1), 1) else signif(upper.CL, 3),
+           p        = round(p.value, 3)) |>
+    dplyr::select(variable, contrast, any_of("Depth"), effect, estimate, lower, upper, p)
+}
+
+planned_by_depth <- map_dfr(responses, planned_one)
+planned_overall  <- map_dfr(responses, planned_one, specs = ~ Amendment)
+
+planned_by_depth
+planned_overall
+planned_by_depth |> filter(p < 0.05)
+```
+```{r depth avg and strat}
+#| label: depth-profile
+# one value per plot: mean of the three 4" layers (= depth-weighted mean)
+profile <- plfa |>
+  group_by(Plot, Rep, Amendment, System) |>
+  summarise(across(all_of(responses), mean), .groups = "drop")
+
+# stratification ratio: surface / deepest layer
+strat_vars <- c("total_PLFA", "AM.Fungi_nmol", "Gram.Negative_nmol",
+                "Gram.Positive_nmol", "Actinomycetes_nmol", "Fungi_nmol")
+
+strat <- plfa |>
+  dplyr::select(Plot, Depth, all_of(strat_vars)) |>
+  pivot_longer(all_of(strat_vars)) |>
+  pivot_wider(names_from = Depth, values_from = value) |>
+  mutate(SR = `0-4"` / `8-12"`) |>
+  dplyr::select(Plot, name, SR) |>
+  pivot_wider(names_from = name, values_from = SR, names_prefix = "SR_")
+
+prof <- left_join(profile, strat, by = "Plot")
+prof_vars <- c(responses, paste0("SR_", strat_vars))
+
+fit_prof <- function(var) {
+  y <- if (var %in% log_vars) paste0("log(", var, ")") else var
+  lmer(as.formula(paste(y, "~ Amendment * System + (1 | Rep) + (1 | Rep:System)")),
+       data = prof)
+}
+prof_models <- set_names(prof_vars) |> map(fit_prof)
+
+# ANOVA p-values for profile averages and stratification ratios
+prof_anova <- imap_dfr(prof_models, function(m, v) {
+  a <- anova(m, type = 3)
+  tibble(variable = v, term = rownames(a), p = signif(a$`Pr(>F)`, 3))
+}) |>
+  pivot_wider(names_from = term, values_from = p)
+prof_anova
+
+# planned contrasts on the profile values
+prof_planned <- map_dfr(prof_vars, planned_one, specs = ~ Amendment, mods = prof_models)
+prof_planned
+prof_planned |> filter(p < 0.1)
+
+# stratification plot: 1 = no difference between surface and 8-12"
+ggplot(prof, aes(Amendment, SR_total_PLFA, color = System)) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5,
+               position = position_dodge(0.6)) +
+  geom_point(position = position_dodge(0.6), size = 2, alpha = 0.7) +
+  geom_hline(yintercept = 1, linetype = 2) +
+  labs(x = NULL, y = 'Stratification ratio (0-4" / 8-12")', color = NULL) +
+  theme_bw() + theme(legend.position = "bottom")
+```
+
+**Biosolids plots have about 10% less AMF than NoFert (p = 0.014) and Fertilizer (p = 0.011). Fertilizer and NoFert are the same (0.877 vs. 0.873).
+It only happens without cover crop and grazing. In No CC / No Graze, biosolids have 0.72 nmol/g vs. about 0.87–0.88 for the other two (a vs. b). Under CC + Graze, all three are the same (about 0.86–0.88).
+Soil interpretation:
+Something in the biosolids suppresses AMF. Phosphorus is the most likely candidate: AMF colonization drops when plants can get P easily.
+A living cover crop seems to buffer this, because it gives AMF host roots to colonize.
+Soil P data would let you test this directly.**
+```{r redo depth amendment}
+#| label: depth-profile
+# one value per plot: mean of the three 4" layers (= depth-weighted mean)
+profile <- plfa |>
+  group_by(Plot, Rep, Amendment, System) |>
+  summarise(across(all_of(responses), mean), .groups = "drop")
+
+# stratification ratio: surface / deepest layer
+strat_vars <- c("total_PLFA", "AM.Fungi_nmol", "Gram.Negative_nmol",
+                "Gram.Positive_nmol", "Actinomycetes_nmol", "Fungi_nmol")
+
+strat <- plfa |>
+  dplyr::select(Plot, Depth, all_of(strat_vars)) |>
+  pivot_longer(all_of(strat_vars)) |>
+  pivot_wider(names_from = Depth, values_from = value) |>
+  mutate(SR = `0-4"` / `8-12"`) |>
+  dplyr::select(Plot, name, SR) |>
+  pivot_wider(names_from = name, values_from = SR, names_prefix = "SR_")
+
+prof <- left_join(profile, strat, by = "Plot")
+prof_vars <- c(responses, paste0("SR_", strat_vars))
+
+fit_prof <- function(var) {
+  y <- if (var %in% log_vars) paste0("log(", var, ")") else var
+  lmer(as.formula(paste(y, "~ Amendment * System + (1 | Rep) + (1 | Rep:System)")),
+       data = prof)
+}
+prof_models <- set_names(prof_vars) |> map(fit_prof)
+
+# ANOVA p-values for profile averages and stratification ratios
+prof_anova <- imap_dfr(prof_models, function(m, v) {
+  a <- anova(m, type = 3)
+  tibble(variable = v, term = rownames(a), p = signif(a$`Pr(>F)`, 3))
+}) |>
+  pivot_wider(names_from = term, values_from = p)
+prof_anova
+
+# ---- amendment-specific comparisons ----
+prof_emm <- function(var, specs = ~ Amendment) get_emm(var, specs, prof_models)
+
+# 1. Tukey letters: mean + letter for each amendment (averaged over System)
+prof_letters <- map_dfr(prof_vars, function(v) {
+  cld(prof_emm(v), Letters = letters, type = "response") |>
+    as_tibble() |> mean_col() |>
+    transmute(variable = v, Amendment, mean = signif(mean, 3),
+              .group = str_trim(.group))
+}) |>
+  arrange(variable, Amendment) |>
+  mutate(label = paste0(mean, " ", .group)) |>
+  dplyr::select(variable, Amendment, label) |>
+  pivot_wider(names_from = Amendment, values_from = label)
+prof_letters
+
+# 2. All pairwise comparisons (Tukey-adjusted) with effect sizes + 95% CI
+prof_pairs <- map_dfr(prof_vars, function(v) {
+  s <- summary(pairs(prof_emm(v), adjust = "tukey", reverse = TRUE),
+               infer = TRUE, type = "response") |> as_tibble()
+  is_log <- "ratio" %in% names(s)
+  s |> transmute(variable = v, contrast,
+                 effect   = if (is_log) "% change" else "difference",
+                 estimate = if (is_log) round(100 * (ratio - 1), 1) else round(estimate, 4),
+                 lower    = if (is_log) round(100 * (lower.CL - 1), 1) else round(lower.CL, 4),
+                 upper    = if (is_log) round(100 * (upper.CL - 1), 1) else round(upper.CL, 4),
+                 p_tukey  = round(p.value, 3))
+})
+prof_pairs
+prof_pairs |> filter(p_tukey < 0.1)
+
+# 3. AMF: amendment within each System (Amendment x System p = 0.02)
+cld(prof_emm("AM.Fungi_nmol", ~ Amendment | System), Letters = letters, type = "response")
+
+# stratification plot: 1 = no difference between surface and 8-12"
+ggplot(prof, aes(Amendment, SR_total_PLFA, color = System)) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5,
+               position = position_dodge(0.6)) +
+  geom_point(position = position_dodge(0.6), size = 2, alpha = 0.7) +
+  geom_hline(yintercept = 1, linetype = 2) +
+  labs(x = NULL, y = 'Stratification ratio (0-4" / 8-12")', color = NULL) +
+  theme_bw() + theme(legend.position = "bottom")
+```
+**Averaged over the 0–12" profile, AMF biomass was ~10% lower under biosolids than under fertilizer or no fertilizer (Tukey p ≤ 0.014), an effect confined to the system without cover crop and grazing (Amendment × System p = 0.022).**
+
+#10. Adding soil data (C, N, OM,	ACE Protein,	β-glucosidase activity)
+
+```{r add data}
+#| label: soil-read
+soil_file <- "../data/26-19D_OSU results_JS1426.xlsx"
+
+soil <- read_excel(soil_file, sheet = "Report", skip = 2,
+                   col_names = c("Sample", "LabID", "C_pct", "N_pct", "OM_pct",
+                                 "ACE_protein", "BG_activity")) |>
+  filter(str_detect(Sample, "^D\\d{2}-\\d{4}$")) |>
+  mutate(across(C_pct:BG_activity, as.numeric),
+         CN_ratio = C_pct / N_pct) |>
+  dplyr::select(-LabID, -OM_pct)          # OM = C x 2, redundant
+
+plfa <- plfa |>
+  dplyr::select(-any_of(setdiff(names(soil), "Sample"))) |>   # safe to re-run
+  left_join(soil, by = "Sample")
+
+nrow(soil)                 # should be 54
+sum(is.na(plfa$C_pct))     # should be 0
+```
+```{r anova-soil}
+#| label: soil-anova
+soil_vars <- c("C_pct", "N_pct", "CN_ratio", "ACE_protein", "BG_activity")
+log_vars  <- union(log_vars, soil_vars)
+
+soil_models <- set_names(soil_vars) |> map(fit_one)
+
+soil_anova <- imap_dfr(soil_models, function(m, v) {
+  a <- anova(m, type = 3)
+  tibble(variable = v, term = rownames(a),
+         F = round(a$`F value`, 2), df_den = round(a$DenDF, 1),
+         p = signif(a$`Pr(>F)`, 3),
+         eta2_p = round((a$`F value` * a$NumDF) /
+                        (a$`F value` * a$NumDF + a$DenDF), 2))
+})
+
+# p-values
+soil_anova |> dplyr::select(variable, term, p) |>
+  pivot_wider(names_from = term, values_from = p)
+
+# effect sizes
+soil_anova |> dplyr::select(variable, term, eta2_p) |>
+  pivot_wider(names_from = term, values_from = eta2_p)
+
+# Tukey letters, amendment within depth (back-transformed means)
+soil_posthoc <- function(var, specs = ~ Amendment | Depth) {
+  cld(get_emm(var, specs, soil_models), Letters = letters, type = "response") |>
+    as_tibble() |> mutate(.group = str_trim(.group))
+}
+map(set_names(soil_vars), soil_posthoc)
+
+# Amendment x System for total C (interaction p = 0.04)
+soil_posthoc("C_pct", ~ Amendment | System)
+
+# residual checks
+par(mfrow = c(2, 3))
+iwalk(soil_models, function(m, v) { qqnorm(resid(m), main = v); qqline(resid(m)) })
+par(mfrow = c(1, 1))
+
+plot_resp("C_pct", "Total C (%)")
+plot_resp("ACE_protein", "ACE protein (mg/g soil)")
+plot_resp("BG_activity", "β-glucosidase (nmol/g soil/h)")
+```
+```{r soil-microbe interactions}
+#| label: soil-plfa-correlations
+cor_x <- c("total_PLFA", "AM.Fungi_nmol", "Gram.Negative_nmol", "Gram.Positive_nmol",
+           "Actinomycetes_nmol", "Fungi_nmol", "F_B", "Gpos_Gneg",
+           "Sat_Unsat", "Gneg_stress", "NLFA_PLFA")
+
+cor_tbl <- expand_grid(Depth = levels(plfa$Depth), plfa_var = cor_x, soil_var = soil_vars) |>
+  mutate(test = pmap(list(Depth, plfa_var, soil_var), function(d, x, y) {
+    sub <- filter(plfa, Depth == d)
+    cor.test(sub[[x]], sub[[y]], method = "spearman", exact = FALSE)
+  }),
+  rho = map_dbl(test, ~ round(unname(.x$estimate), 2)),
+  p   = map_dbl(test, ~ .x$p.value)) |>
+  dplyr::select(-test) |>
+  mutate(Depth = factor(Depth, levels = levels(plfa$Depth)),
+         sig = case_when(p < 0.001 ~ "***", p < 0.01 ~ "**", p < 0.05 ~ "*", TRUE ~ ""))
+
+cor_tbl |> filter(p < 0.05) |> arrange(Depth, p)
+
+ggplot(cor_tbl, aes(soil_var, plfa_var, fill = rho)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = paste0(sprintf("%.2f", rho), sig)), size = 2.8) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       limits = c(-1, 1)) +
+  facet_wrap(~ Depth) +
+  labs(x = NULL, y = NULL, fill = "Spearman ρ") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+```{r redundacy analysis}
+#| label: soil-rda
+rda_dat <- comm |>
+  left_join(dplyr::select(soil, Sample, all_of(soil_vars)), by = "Sample")
+
+comm_hel <- decostand(rda_dat[keep], method = "hellinger")
+env <- rda_dat |>
+  transmute(Depth,
+            log_C   = log(C_pct),
+            CN      = CN_ratio,
+            log_ACE = log(ACE_protein),
+            log_BG  = log(BG_activity))
+# N_pct left out: nearly duplicates C (and is coarse)
+
+cor(env[-1]) |> round(2)          # how correlated the predictors are
+
+rda_mod <- rda(comm_hel ~ log_C + CN + log_ACE + log_BG + Condition(Depth), data = env)
+vif.cca(rda_mod)                  # > 10 = serious collinearity
+RsquareAdj(rda_mod)               # variation explained after removing depth
+
+set.seed(14)
+anova(rda_mod, permutations = how(nperm = 999, blocks = env$Depth))                 # overall
+set.seed(14)
+anova(rda_mod, by = "margin", permutations = how(nperm = 999, blocks = env$Depth))  # each term
+
+site_sc <- as_tibble(scores(rda_mod, display = "sites", choices = 1:2)) |>
+  bind_cols(dplyr::select(rda_dat, Amendment, System, Depth))
+arrows  <- as_tibble(scores(rda_mod, display = "bp", choices = 1:2), rownames = "var")
+mult    <- 0.8 * max(abs(site_sc$RDA1), abs(site_sc$RDA2)) /
+                 max(abs(arrows$RDA1), abs(arrows$RDA2))
+
+ggplot(site_sc, aes(RDA1, RDA2)) +
+  geom_point(aes(color = Amendment, shape = Depth), size = 2.5, alpha = 0.8) +
+  geom_segment(data = arrows, aes(x = 0, y = 0, xend = RDA1 * mult, yend = RDA2 * mult),
+               arrow = arrow(length = unit(0.2, "cm")), inherit.aes = FALSE) +
+  geom_text(data = arrows, aes(RDA1 * mult * 1.1, RDA2 * mult * 1.1, label = var),
+            size = 3.5, inherit.aes = FALSE) +
+  theme_bw() +
+  labs(caption = "Partial RDA of PLFA peak profiles (Hellinger), depth removed")
+
+# share of community variation explained by depth vs. soil properties
+round(c(depth_share = rda_mod$pCCA$tot.chi / rda_mod$tot.chi,
+        soil_share  = rda_mod$CCA$tot.chi  / rda_mod$tot.chi), 3)
+
+# forward selection to handle collinear predictors
+rda0 <- rda(comm_hel ~ 1 + Condition(Depth), data = env)
+set.seed(14)
+rda_sel <- ordiR2step(rda0, scope = formula(rda_mod), R2scope = TRUE,
+                      permutations = how(nperm = 999, blocks = env$Depth),
+                      trace = FALSE)
+rda_sel$anova
+RsquareAdj(rda_sel)
+```
+```{r PCA}
+#| label: pca
+# PCA of Hellinger-transformed PLFA peak profiles
+pca <- rda(comm_hel)                         # rda() with no predictors = PCA
+pca_var <- round(100 * pca$CA$eig / sum(pca$CA$eig), 1)
+pca_var[1:5]                                 # % variation on each axis
+
+pca_sites <- as_tibble(scores(pca, display = "sites", choices = 1:2, scaling = 1)) |>
+  bind_cols(dplyr::select(rda_dat, Amendment, System, Depth))
+
+# peaks that drive PC1 and PC2 most
+top_peaks <- as_tibble(scores(pca, display = "species", choices = 1:2, scaling = 1),
+                       rownames = "peak") |>
+  mutate(length = sqrt(PC1^2 + PC2^2)) |>
+  slice_max(length, n = 8)
+top_peaks
+
+# soil variables fitted onto the PCA (permutations within depth)
+set.seed(14)
+pca_fit <- envfit(pca, rda_dat |> dplyr::select(C_pct, CN_ratio, ACE_protein, BG_activity),
+                  choices = 1:2, permutations = how(nperm = 999, blocks = rda_dat$Depth))
+pca_fit
+
+soil_arrows <- as_tibble(scores(pca_fit, display = "vectors"), rownames = "var")
+mult <- 0.8 * max(abs(pca_sites$PC1)) / max(abs(soil_arrows$PC1), abs(soil_arrows$PC2))
+
+ggplot(pca_sites, aes(PC1, PC2)) +
+  geom_point(aes(color = Depth, shape = Amendment), size = 2.5, alpha = 0.8) +
+  geom_segment(data = soil_arrows, aes(x = 0, y = 0, xend = PC1 * mult, yend = PC2 * mult),
+               arrow = arrow(length = unit(0.2, "cm")), inherit.aes = FALSE) +
+  geom_text(data = soil_arrows, aes(PC1 * mult * 1.12, PC2 * mult * 1.12, label = var),
+            size = 3.2, inherit.aes = FALSE) +
+  labs(x = paste0("PC1 (", pca_var[1], "%)"), y = paste0("PC2 (", pca_var[2], "%)")) +
+  theme_bw()
+
+# separate PCA within each depth: removes the depth gradient to show treatments
+pca_by_depth <- map(set_names(levels(rda_dat$Depth)), function(d) {
+  keep_rows <- rda_dat$Depth == d
+  p <- rda(comm_hel[keep_rows, ])
+  v <- round(100 * p$CA$eig / sum(p$CA$eig), 1)
+  as_tibble(scores(p, display = "sites", choices = 1:2, scaling = 1)) |>
+    bind_cols(dplyr::select(rda_dat[keep_rows, ], Amendment, System)) |>
+    mutate(lab = paste0(d, ": PC1 ", v[1], "%, PC2 ", v[2], "%"))
+}) |> bind_rows()
+
+ggplot(pca_by_depth, aes(PC1, PC2, color = Amendment)) +
+  geom_point(aes(shape = System), size = 2.5, alpha = 0.8) +
+  stat_ellipse(aes(group = Amendment), linetype = 2, show.legend = FALSE) +
+  facet_wrap(~ lab, scales = "free") +
+  theme_bw() + theme(legend.position = "bottom")
+```
+
+#Big Takeaways: 
+
+- depth is the most significant driver by a LOT, for 13 out of 14 PLFA variables.Shallower depth is associated with more microbial activity
+-The deeper community is also a different kind of community: relatively fewer fungi (F:B 0.16 → 0.11), more Gram-positives and Actinobacteria, and higher bacterial stress indicators. In soil terms, the subsoil is carbon-poor and supports a smaller, more stress-tolerant community.
+- Soil measurement data results: Within each depth, plots with more C, N and β-glucosidase activity have more microbes (ρ up to 0.85; 48 of 165 correlations significant). Composition of microbes are not greatly impacted by C, N, and b glu. 
+- Biosolids have 35% more total C (0-4") but is only a shallow depth result
+
+-Biosolids reduced AMF biomass by ~10% (p = 0.014) but only in the system without cover crop and grazing. This is possibly due to the high P content of biosolids? which reduces AMF colonization. A living cover crop seems to buffer this effect, likely by providing AMF host roots to colonize.
+-Both amendments show:
+  slightly more biomass (+8%)
+  more Gram-positives (+10–12%)
+  higher Sat:Unsat and a lower G− stress ratio, both pointing to more stressed or slower-growing bacteria.
+This indicates that the amendments are changing community and biomass compared to unfertilized.
+
+-Low degrees of freedom. Sample with more reps in future to detect better differences (3 reps not enough)
