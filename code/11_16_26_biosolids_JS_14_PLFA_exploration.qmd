@@ -843,3 +843,255 @@ ggplot(pca_by_depth, aes(PC1, PC2, color = Amendment)) +
 This indicates that the amendments are changing community and biomass compared to unfertilized.
 
 -Low degrees of freedom. Sample with more reps in future to detect better differences (3 reps not enough)
+
+
+# 11. 2022, 2023, 2024 data comparisons:
+
+Data from previous years were entered differently, so need to clean up to make comparisons. Also need to remove GP-17 from data. 
+# 11. Multi-year comparison (2022–2026)
+
+Data from previous years were entered differently, so they need cleaning before comparing. GP-17 is removed.
+
+```{r}
+#| label: multiyear-read-groups
+file_22     <- "../data/PLFA with lipid data_GP17&JS14 22.csv"
+file_23_raw <- "../data/raw lipids data_GP17&JS14 23.csv"
+file_23_ids <- "../data/PLFA results for sample id match_GP17&JS1423.csv"
+file_24     <- "../data/PLFA with lipid data_GP17&JS14 23.csv"   # 2024 samples despite the "23" name
+
+# plot -> treatment lookup from the 2026 key (same plots every year)
+plot_info <- key |>
+  filter(Depth == '0-4"') |>
+  distinct(Plot, Rep, Amendment, System)
+
+# sample IDs run in plot order within each depth (11, 12, ... 36), as in the 2026 key
+plot_order <- key |> filter(Depth == '0-4"') |> arrange(Sample) |> pull(Plot)
+
+# Fix peak names Excel turned into times ("16:00" -> "16:0", "24:00:00" -> "24:0")
+fix_peak <- function(x) {
+  x |> str_replace("^(\\d+):00:00$", "\\1:0") |> str_replace("^(\\d+):00$", "\\1:0")
+}
+
+# ---- 2022 (all three depths) ----
+raw22 <- read_csv(file_22, show_col_types = FALSE, name_repair = "unique_quiet")
+
+lipids22 <- raw22 |>
+  filter(Project == "JS-14") |>
+  transmute(Year = 2022, Sample = Sample.ID.2, Plot = factor(Plot),
+            Depth, label = Treatment, peak = fix_peak(name), amount = ngPERg)
+
+# check: the 2022 label vs. the treatment for that plot number (plot 13 is mislabelled)
+lipids22 |> distinct(Plot, label) |> left_join(plot_info, by = "Plot") |> print(n = 18)
+
+# ---- 2023 (all three depths; lab numbers matched to sample IDs) ----
+ids23 <- read_csv(file_23_ids, show_col_types = FALSE) |>
+  filter(`Sample ID 1` == "JS-14") |>
+  transmute(ID = `Lab No`, Sample = `Sample ID 2`,
+            Depth = paste0(`Beginning Depth`, "-", `Ending Depth`, '"'),
+            # ASSUMED: within each depth, D23-7000 = plot 11 ... D23-7017 = plot 36
+            Plot = plot_order[(as.integer(str_sub(Sample, -4)) - 7000) %% 18 + 1])
+
+ids23 |> count(Depth)          # should be 18 per depth
+
+lipids23 <- read_csv(file_23_raw, show_col_types = FALSE, name_repair = "unique_quiet") |>
+  inner_join(ids23, by = "ID") |>
+  transmute(Year = 2023, Sample, Plot, Depth, label = NA_character_,
+            peak = fix_peak(name), amount = ngPERg)
+
+# ---- 2024 (0-4" only) ----
+raw24 <- read_csv(file_24, show_col_types = FALSE, name_repair = "unique_quiet")
+
+lipids24 <- raw24 |>
+  filter(project == "JS-14", !is.na(Biomarker)) |>
+  mutate(Plot = plot_order[as.integer(str_sub(sample_id, -4)) - 7065]) |>
+  transmute(Year = 2024, Sample = sample_id, Plot, Depth,
+            label = paste(treat_fert, treat_crop), peak = fix_peak(Biomarker), amount = ngPERg)
+
+# check: labels should match the plot lookup exactly
+lipids24 |> distinct(Plot, label) |> left_join(plot_info, by = "Plot") |> print(n = 18)
+
+# ---- 2026 (SHAC, pmol/g) ----
+lipids26 <- read_shac("Amnt-P") |>
+  dplyr::select(-`Total PLFA (pmols/g)`, -`Total PLFA#`) |>
+  pivot_longer(-Sample, names_to = "peak", values_to = "amount") |>
+  left_join(dplyr::select(key, Sample, Plot, Depth), by = "Sample") |>
+  transmute(Year = 2026, Sample, Plot, Depth, label = NA_character_, peak, amount)
+
+# ---- convert everything to nmol/g ----
+# 2022-2024 are ng/g (mass); 2026 is pmol/g (moles). Divide mass by each peak's
+# molecular weight (as its methyl ester, FAME), calculated from the peak name:
+# "16:0" = 16 C, 0 double bonds; "10-methyl" adds a carbon; "cyclo" ring = 1 unsaturation;
+# "OH" adds an oxygen. Aldehydes/alcohols/DMAs are approximated as the FAME of the same chain.
+fame_mw <- function(peak) {
+  n  <- as.numeric(str_match(peak, "^(\\d+):")[, 2]) + str_detect(peak, "methyl")
+  d  <- as.numeric(str_match(peak, "^\\d+:(\\d+)")[, 2]) + str_detect(peak, "cyclo")
+  oh <- str_count(peak, "OH")
+  12.011 * (n + 1) + 1.008 * (2 * (n + 1) - 2 * d) + 15.999 * (2 + oh)
+}
+
+# ---- combine: keep real fatty-acid peaks, convert to nmol/g, sum duplicate peaks ----
+lipids <- bind_rows(lipids22, lipids23, lipids24, lipids26) |>
+  filter(str_detect(peak, "^\\d+:\\d"),               # drops Undifferentiated, Solvent, Phthalate
+         peak != "19:0") |>                             # 19:0 = lab internal standard, not soil
+  mutate(amount = if_else(Year == 2026,
+                          amount / 1000,                  # SHAC pmol/g -> nmol/g
+                          amount / fame_mw(peak))) |>     # ng/g -> nmol/g
+  group_by(Year, Sample, Plot, Depth, peak) |>
+  summarise(amount = sum(amount), .groups = "drop") |>
+  mutate(Plot = factor(Plot, levels = levels(plot_info$Plot)),
+         Depth = factor(Depth, levels = levels(key$Depth))) |>
+  left_join(plot_info, by = "Plot")
+
+lipids |> distinct(Year, Sample, Depth) |> count(Year, Depth)
+
+# ---- microbial groups: same peak definitions for every year ----
+group_peaks <- function(d) {
+  d |>
+    mutate(chain = as.numeric(str_extract(peak, "^\\d+"))) |>   # leading number = chain length
+    group_by(Year, Sample, Plot, Rep, Amendment, System, Depth) |>
+    summarise(
+      total_all = sum(amount),                                  # every identified peak
+      total     = sum(amount[chain >= 14 & chain <= 20]),       # study definition: C14:0-C20:0
+      gram_pos = sum(amount[str_detect(peak, "^\\d+:0 (iso|anteiso)$")]),
+      gram_neg = sum(amount[(str_detect(peak, "^\\d+:1 w\\d+c$") &
+                             !peak %in% c("16:1 w5c", "18:1 w9c")) |
+                            str_detect(peak, "cyclo")]),
+      actino   = sum(amount[str_detect(peak, "10-methyl")]),
+      amf      = sum(amount[peak == "16:1 w5c"]),
+      fungi    = sum(amount[peak == "18:2 w6c"]),
+      pre      = sum(amount[peak %in% c("16:1 w7c", "18:1 w7c")]),
+      cyc      = sum(amount[peak %in% c("17:0 cyclo w7c", "19:0 cyclo w7c")]),
+      .groups = "drop") |>
+    mutate(F_B         = fungi / (gram_pos + gram_neg + actino),
+           Gpos_Gneg   = gram_pos / gram_neg,
+           Gneg_stress = pre / cyc,                      # SHAC direction: lower = more stress
+           across(c(gram_pos, gram_neg, actino, amf, fungi),
+                  ~ 100 * .x / total, .names = "{.col}_pct")) |>
+    dplyr::select(-pre, -cyc)
+}
+
+yr <- group_peaks(lipids) |> mutate(Year = factor(Year))
+yr_vars <- c("total", "gram_pos", "gram_neg", "actino", "amf", "fungi",
+             "F_B", "Gpos_Gneg", "Gneg_stress")
+
+# means at 0-4" (units differ: 2022/2023/2024 ng/g, 2026 pmol/g)
+yr |>
+  filter(Depth == '0-4"') |>
+  group_by(Year, Amendment) |>
+  summarise(across(all_of(yr_vars), ~ signif(mean(.x), 3)), .groups = "drop")
+```
+
+```{r}
+#| label: multiyear-model
+# ---- check the assumed 2023 plot order ----
+# Plots keep their character from year to year (soil C, landscape position).
+# If the assumed 2023 plot order is right, 2023 plot values should correlate with
+# the same plots in other years better than randomly shuffled plot labels do.
+plot_profile <- yr |>
+  filter(Year %in% c(2022, 2023, 2026)) |>          # years with all three depths
+  group_by(Year, Plot) |>
+  summarise(total = mean(log(total)), F_B = mean(F_B),
+            fungi_pct = mean(fungi_pct), actino_pct = mean(actino_pct), .groups = "drop")
+
+order_check <- function(var, ref_year, n_perm = 9999) {
+  a <- plot_profile |> filter(Year == 2023)     |> arrange(Plot) |> pull(.data[[var]])
+  b <- plot_profile |> filter(Year == ref_year) |> arrange(Plot) |> pull(.data[[var]])
+  obs  <- cor(a, b, method = "spearman")
+  perm <- replicate(n_perm, cor(sample(a), b, method = "spearman"))
+  tibble(variable = var, compared_to = ref_year, rho = round(obs, 2),
+         p_perm = round((sum(perm >= obs) + 1) / (n_perm + 1), 4))
+}
+
+set.seed(23)
+expand_grid(variable = c("total", "F_B", "fungi_pct", "actino_pct"),
+            ref = c(2022, 2026)) |>
+  pmap_dfr(\(variable, ref) order_check(variable, ref))
+
+# ---- model: 0-4" is the only depth sampled in every year ----
+# Zeros (peak not detected) can't be logged: replace with half the smallest
+# detected value for that variable in that year. Inf ratios (no cyclo peaks) -> NA.
+yr0 <- yr |>
+  filter(Depth == '0-4"') |>
+  mutate(across(all_of(yr_vars), ~ if_else(is.finite(.x), .x, NA_real_))) |>
+  group_by(Year) |>
+  mutate(across(all_of(yr_vars), ~ if_else(.x == 0, min(.x[.x > 0], na.rm = TRUE) / 2, .x))) |>
+  ungroup()
+
+# flag unusual samples: AMF share far above the rest (2024 plot 12 = D24-7067)
+yr0 |> group_by(Year) |> slice_max(amf_pct, n = 2) |>
+  dplyr::select(Year, Sample, Plot, Amendment, total, amf, amf_pct)
+
+# Each year gets its own residual variance (varIdent).
+# Random effects follow the split-plot nesting: Rep > System (main plot) > Plot,
+# and each Plot is measured in every year.
+fit_year <- function(var, dat = yr0) {
+  dat$y <- log(dat[[var]])
+  nlme::lme(y ~ Year * Amendment * System,
+            random  = ~ 1 | Rep/System/Plot,
+            weights = nlme::varIdent(form = ~ 1 | Year),
+            data = dat, na.action = na.omit, method = "REML",
+            control = nlme::lmeControl(opt = "optim", maxIter = 200, msMaxIter = 200))
+}
+yr_models <- set_names(yr_vars) |> map(fit_year)
+
+# ANOVA (ignore the Year main effect: it mixes year with the lab change)
+yr_anova <- imap_dfr(yr_models, function(m, v) {
+  a <- anova(m, type = "marginal")
+  tibble(variable = v, term = rownames(a), p = signif(a$`p-value`, 3))
+}) |>
+  filter(term != "(Intercept)") |>
+  pivot_wider(names_from = term, values_from = p)
+yr_anova
+
+# % difference from NoFert within each year (unit-free, comparable across years)
+yr_effects <- map_dfr(yr_vars, function(v) {
+  em <- emmeans(yr_models[[v]], ~ Amendment | Year, tran = "log")
+  summary(contrast(em, "trt.vs.ctrl", ref = "NoFert", adjust = "none"),
+          infer = TRUE, type = "response") |>
+    as_tibble() |>
+    transmute(variable = v, Year, contrast,
+              pct_change = round(100 * (ratio - 1), 1),
+              lower = round(100 * (lower.CL - 1), 1),
+              upper = round(100 * (upper.CL - 1), 1),
+              p = round(p.value, 3))
+})
+yr_effects
+yr_effects |> filter(p < 0.1)
+
+# Tukey letters within each year
+yr_letters <- map_dfr(yr_vars, function(v) {
+  cld(emmeans(yr_models[[v]], ~ Amendment | Year, tran = "log"),
+      Letters = letters, type = "response") |>
+    as_tibble() |>
+    transmute(variable = v, Year, Amendment, .group = str_trim(.group))
+}) |>
+  arrange(variable, Year, Amendment) |>
+  pivot_wider(names_from = Amendment, values_from = .group)
+yr_letters
+
+# effect sizes across years
+ggplot(yr_effects, aes(Year, pct_change, color = contrast)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_pointrange(aes(ymin = lower, ymax = upper), position = position_dodge(0.4)) +
+  facet_wrap(~ variable, scales = "free_y") +
+  labs(x = NULL, y = "% difference from NoFert (95% CI), 0-4\"", color = NULL) +
+  theme_bw() + theme(legend.position = "bottom")
+
+# raw values by year (all nmol/g, shared y-axis)
+ggplot(yr0, aes(Amendment, total, color = System)) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5, position = position_dodge(0.6)) +
+  geom_point(position = position_dodge(0.6), size = 2, alpha = 0.7) +
+  facet_wrap(~ Year, nrow = 1) +
+  labs(x = NULL, y = "Total PLFA (nmol/g soil), 0-4\"", color = NULL,
+       caption = "2022-2024: commercial lab; 2026: SHAC (different extraction, so levels are not comparable)") +
+  theme_bw() + theme(legend.position = "bottom")
+# sensitivity check: refit without the unusual 2024 sample
+yr_anova_noout <- imap_dfr(set_names(yr_vars) |> map(fit_year, dat = filter(yr0, Sample != "D24-7067")),
+  function(m, v) {
+    a <- anova(m, type = "marginal")
+    tibble(variable = v, term = rownames(a), p = signif(a$`p-value`, 3))
+  }) |>
+  filter(term != "(Intercept)") |>
+  pivot_wider(names_from = term, values_from = p)
+yr_anova_noout
+```
